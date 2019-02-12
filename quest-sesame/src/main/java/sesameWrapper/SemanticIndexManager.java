@@ -1,28 +1,8 @@
 package sesameWrapper;
 
-/*
- * #%L
- * ontop-quest-sesame
- * %%
- * Copyright (C) 2009 - 2014 Free University of Bozen-Bolzano
- * %%
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- * 
- *      http://www.apache.org/licenses/LICENSE-2.0
- * 
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- * #L%
- */
-
 import it.unibz.krdb.obda.ontology.ImmutableOntologyVocabulary;
 import it.unibz.krdb.obda.ontology.Ontology;
-import it.unibz.krdb.obda.owlapi3.OWLAPI3ABoxIterator;
+import it.unibz.krdb.obda.owlapi3.OWLAPIABoxIterator;
 import it.unibz.krdb.obda.owlrefplatform.core.abox.RDBMSSIRepositoryManager;
 import it.unibz.krdb.obda.owlrefplatform.core.dagjgrapht.TBoxReasoner;
 import it.unibz.krdb.obda.owlrefplatform.core.dagjgrapht.TBoxReasonerImpl;
@@ -34,7 +14,6 @@ import org.openrdf.rio.turtle.TurtleParser;
 import org.semanticweb.owlapi.model.OWLOntology;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
 import java.io.BufferedReader;
 import java.io.FileNotFoundException;
 import java.io.FileReader;
@@ -51,135 +30,102 @@ import java.sql.SQLException;
  */
 public class SemanticIndexManager {
 
-	private final Connection conn;
+    private final Connection conn;
 
-	private final TBoxReasoner reasoner;
-	private final ImmutableOntologyVocabulary voc;
+    private final TBoxReasoner reasoner;
 
-	private final RDBMSSIRepositoryManager dataRepository;
+    private final ImmutableOntologyVocabulary voc;
 
-	private final Logger log = LoggerFactory.getLogger(this.getClass());
+    private final RDBMSSIRepositoryManager dataRepository;
 
-	public SemanticIndexManager(OWLOntology tbox, Connection connection) throws Exception {
-		conn = connection;
-		Ontology ontologyClosure = QuestOWL.loadOntologies(tbox);
-		voc = ontologyClosure.getVocabulary();
+    private final Logger log = LoggerFactory.getLogger(this.getClass());
 
-		reasoner = TBoxReasonerImpl.create(ontologyClosure, true);
-			
-		dataRepository = new RDBMSSIRepositoryManager(reasoner, ontologyClosure.getVocabulary());
-		dataRepository.generateMetadata(); // generate just in case
+    public SemanticIndexManager(OWLOntology tbox, Connection connection) throws Exception {
+        conn = connection;
+        Ontology ontologyClosure = QuestOWL.loadOntologies(tbox);
+        voc = ontologyClosure.getVocabulary();
+        reasoner = TBoxReasonerImpl.create(ontologyClosure, true);
+        dataRepository = new RDBMSSIRepositoryManager(reasoner, ontologyClosure.getVocabulary());
+        dataRepository.generateMetadata();
+        log.debug("TBox has been processed. Ready to ");
+    }
 
-		log.debug("TBox has been processed. Ready to ");
-	}
+    public void restoreRepository() throws SQLException {
+        dataRepository.loadMetadata(conn);
+        log.debug("Semantic Index metadata was found and restored from the DB");
+    }
 
-	public void restoreRepository() throws SQLException {
-		dataRepository.loadMetadata(conn);
+    public void setupRepository(boolean drop) throws SQLException {
+        if (drop) {
+            log.debug("Droping existing tables");
+            try {
+                dataRepository.dropDBSchema(conn);
+            } catch (SQLException e) {
+                log.debug(e.getMessage(), e);
+            }
+        }
+        dataRepository.createDBSchemaAndInsertMetadata(conn);
+        log.debug("Semantic Index repository has been setup.");
+    }
 
-		log.debug("Semantic Index metadata was found and restored from the DB");
-	}
+    public void dropRepository() throws SQLException {
+        dataRepository.dropDBSchema(conn);
+    }
 
-	public void setupRepository(boolean drop) throws SQLException {
+    public void updateMetadata() throws SQLException {
+        dataRepository.insertMetadata(conn);
+        log.debug("Updated metadata in the repository");
+    }
 
-		if (drop) {
-			log.debug("Droping existing tables");
-			try {
-				dataRepository.dropDBSchema(conn);
-			}
-			catch (SQLException e) {
-				log.debug(e.getMessage(), e);
-			}
-		}
-		
-		dataRepository.createDBSchemaAndInsertMetadata(conn);
+    public int insertData(OWLOntology ontology, int commitInterval, int batchSize) throws SQLException {
+        OWLAPIABoxIterator aBoxIter = new OWLAPIABoxIterator(ontology.getOWLOntologyManager().getImportsClosure(ontology), voc);
+        int result = dataRepository.insertData(conn, aBoxIter, commitInterval, batchSize);
+        log.info("Loaded {} items into the DB.", result);
+        return result;
+    }
 
-		log.debug("Semantic Index repository has been setup.");
-	}
-	
-	public void dropRepository() throws SQLException {
-		dataRepository.dropDBSchema(conn);
-	}
+    public int insertDataNTriple(final String ntripleFile, final String baseURI, final int commitInterval, final int batchSize) throws SQLException, RDFParseException, RDFHandlerException, FileNotFoundException, IOException {
+        final TurtleParser parser = new TurtleParser();
+        final SesameRDFIterator aBoxIter = new SesameRDFIterator();
+        parser.setRDFHandler(aBoxIter);
+        Thread t = new Thread() {
 
-	public void updateMetadata() throws SQLException {
-		dataRepository.insertMetadata(conn);
-		log.debug("Updated metadata in the repository");
-	}
+            @Override
+            public void run() {
+                try {
+                    parser.parse(new BufferedReader(new FileReader(ntripleFile)), baseURI);
+                } catch (RDFParseException e) {
+                    e.printStackTrace();
+                } catch (RDFHandlerException e) {
+                    e.printStackTrace();
+                } catch (FileNotFoundException e) {
+                    e.printStackTrace();
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+            }
+        };
+        final int[] val = new int[1];
+        Thread t2 = new Thread() {
 
-	public int insertData(OWLOntology ontology, int commitInterval, int batchSize) throws SQLException {
-
-		OWLAPI3ABoxIterator aBoxIter = new OWLAPI3ABoxIterator(ontology.getOWLOntologyManager().getImportsClosure(ontology), voc);
-		int result = dataRepository.insertData(conn, aBoxIter, commitInterval, batchSize);
-
-		log.info("Loaded {} items into the DB.", result);
-
-		return result;
-	}
-
-	public int insertDataNTriple(final String ntripleFile, final String baseURI, final int commitInterval, final int batchSize)
-			throws SQLException, RDFParseException, RDFHandlerException, FileNotFoundException, IOException {
-
-		final TurtleParser parser = new TurtleParser();
-		// NTriplesParser parser = new NTriplesParser();
-
-		final SesameRDFIterator aBoxIter = new SesameRDFIterator();
-		
-		parser.setRDFHandler(aBoxIter);
-		
-
-		Thread t = new Thread() {
-			@Override
-			public void run() {
-
-				try {
-					parser.parse(new BufferedReader(new FileReader(ntripleFile)), baseURI);
-				} catch (RDFParseException e) {
-					// TODO Auto-generated catch block
-					e.printStackTrace();
-				} catch (RDFHandlerException e) {
-					// TODO Auto-generated catch block
-					e.printStackTrace();
-				} catch (FileNotFoundException e) {
-					// TODO Auto-generated catch block
-					e.printStackTrace();
-				} catch (IOException e) {
-					// TODO Auto-generated catch block
-					e.printStackTrace();
-				}
-			}
-		};
-
-		final int[] val = new int[1];
-
-		Thread t2 = new Thread() {
-
-			@Override
-			public void run() {
-				try {
-					val[0] = dataRepository.insertData(conn, aBoxIter, commitInterval, batchSize);
-				} catch (SQLException e) {
-					// TODO Auto-generated catch block
-					e.printStackTrace();
-				}
-				log.info("Loaded {} items into the DB.", val[0]);
-
-			}
-
-		};
-
-		t.start();
-		t2.start();
-		try {
-			t.join();
-
-			t2.join();
-		} catch (InterruptedException e) {
-			// TODO Auto-generated catch block
-			e.printStackTrace();
-		}
-		// EquivalentTriplePredicateIterator newData = new
-		// EquivalentTriplePredicateIterator(aBoxIter, equivalenceMaps);
-
-		return val[0];
-	}
-
+            @Override
+            public void run() {
+                try {
+                    val[0] = dataRepository.insertData(conn, aBoxIter, commitInterval, batchSize);
+                } catch (SQLException e) {
+                    e.printStackTrace();
+                }
+                log.info("Loaded {} items into the DB.", val[0]);
+            }
+        };
+        t.start();
+        t2.start();
+        try {
+            t.join();
+            t2.join();
+        } catch (InterruptedException e) {
+            e.printStackTrace();
+        }
+        return val[0];
+    }
 }
